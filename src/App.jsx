@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect } from 'react'
+import { useMemo, useState, useEffect, useRef } from 'react'
 import { Search, Star, Copy, Share2, Filter, ChevronDown, Flame, Swords } from 'lucide-react'
 import { supabase } from './lib/supabaseClient.js'
 
@@ -116,42 +116,92 @@ export default function App(){
     return ()=> { sub?.subscription?.unsubscribe?.() }
   },[supaReady])
 
-  // 初回ロード: コードといいね集計
+  // ページング関連
+  const PAGE_SIZE = 12
+  const [isLoading, setIsLoading] = useState(false)
+  const [hasMore, setHasMore] = useState(true)
+  const [totalCount, setTotalCount] = useState(null)
+
+  // Supabase有効時は初期化
   useEffect(()=>{
     if(!supaReady) return
-    ;(async()=>{
-      const { data: codeRows, error: e1 } = await supabase
-        .from('codes')
-        .select('id, code, title, desc, heroes, maps, role, mode, tags, author, updated')
-        .order('updated', { ascending: false })
-      if(!e1 && codeRows) setCodes(codeRows)
-
-      const { data: allLikes, error: e2 } = await supabase
-        .from('likes')
-        .select('code_id')
-      if(!e2 && allLikes){
-        const cnt = {}
-        for(const row of allLikes){ cnt[row.code_id] = (cnt[row.code_id]||0)+1 }
-        setLikeCounts(cnt)
-      }
-    })()
+    setCodes([])
+    setLikeCounts({})
+    setUserLiked({})
+    setHasMore(true)
+    setTotalCount(null)
   },[supaReady])
 
-  // ユーザーのいいね
+  async function fetchPage(pageIndex){
+    if(!supaReady || isLoading || hasMore===false) return
+    setIsLoading(true)
+    const from = pageIndex * PAGE_SIZE
+    const to = from + PAGE_SIZE - 1
+    const { data: codeRows, error, count } = await supabase
+      .from('codes')
+      .select('id, code, title, desc, heroes, maps, role, mode, tags, author, updated, created_by', { count: 'exact' })
+      .order('updated', { ascending: false })
+      .range(from, to)
+    if(error){ setIsLoading(false); toast('読み込みエラー'); return }
+    setTotalCount(count ?? null)
+    setCodes(prev=>{
+      const map = Object.create(null)
+      for(const c of prev) map[c.id]=c
+      for(const c of (codeRows||[])) map[c.id]=c
+      return Object.values(map)
+    })
+    const ids = (codeRows||[]).map(r=> r.id)
+    if(ids.length>0){
+      const { data: likesRows } = await supabase
+        .from('likes')
+        .select('code_id')
+        .in('code_id', ids)
+      if(likesRows){
+        const cnt = {}
+        for(const r of likesRows) cnt[r.code_id] = (cnt[r.code_id]||0)+1
+        setLikeCounts(m=> ({...m, ...cnt}))
+      }
+      if(user){
+        const { data: myLikes } = await supabase
+          .from('likes')
+          .select('code_id')
+          .eq('user_id', user.id)
+          .in('code_id', ids)
+        if(myLikes){
+          const mine = {}
+          for(const r of myLikes) mine[r.code_id] = true
+          setUserLiked(m=> ({...m, ...mine}))
+        }
+      }
+    }
+    const loaded = ((from)+(codeRows?.length||0))
+    setHasMore(count!=null ? loaded < count : (codeRows?.length||0)===PAGE_SIZE)
+    setIsLoading(false)
+  }
+
+  // 初回のページ読み込み
   useEffect(()=>{
-    if(!supaReady || !user) return
+    if(!supaReady) return
+    if(codes.length===0 && hasMore && !isLoading){ fetchPage(0) }
+  },[supaReady, codes.length])
+
+  // 読み込み済みコードに対して自分のいいね状態を補完
+  useEffect(()=>{
+    if(!supaReady || !user || codes.length===0) return
     ;(async()=>{
-      const { data, error } = await supabase
+      const ids = codes.map(c=> c.id)
+      const { data } = await supabase
         .from('likes')
         .select('code_id')
         .eq('user_id', user.id)
-      if(!error && data){
+        .in('code_id', ids)
+      if(data){
         const map = {}
         for(const r of data) map[r.code_id] = true
-        setUserLiked(map)
+        setUserLiked(m=> ({...m, ...map}))
       }
     })()
-  },[supaReady, user])
+  },[supaReady, user, codes])
 
   const [q, setQ]   = useState('')
   const [role, setRole] = useState('Any')
@@ -160,6 +210,9 @@ export default function App(){
   const [sort, setSort] = useState('copies') // 'updated' | 'likes' | 'copies'
   const [copiedId, setCopiedId] = useState('')
   const [showAllTags, setShowAllTags] = useState(false)
+  const [editingId, setEditingId] = useState('')
+  const [editDraft, setEditDraft] = useState(null)
+  const submitRef = useRef(null)
 
   const allTags = useMemo(() => Array.from(new Set((codes||[]).flatMap(c => c.tags || []))).filter(Boolean).sort(), [codes])
   const tagsToShow = useMemo(() => showAllTags ? allTags : allTags.slice(0, 12), [showAllTags, allTags])
@@ -230,12 +283,105 @@ export default function App(){
     }
   }
 
-  // コード登録（最小）
-  const [newCode, setNewCode] = useState({ code:'', title:'' })
+  function startEdit(item){
+    setEditingId(item.id)
+    setEditDraft({
+      code: item.code,
+      title: item.title,
+      desc: item.desc || '',
+      tagsText: (item.tags||[]).join(', '),
+      heroesText: (item.heroes||[]).join(', '),
+      mapsText: (item.maps||[]).join(', '),
+      role: item.role || 'Any',
+      mode: item.mode || 'Other',
+    })
+  }
+  function cancelEdit(){ setEditingId(''); setEditDraft(null) }
+  async function saveEdit(id){
+    if(!supaReady || !user){ toast('ログインが必要です'); return }
+    const codeNorm = validateCodeFormat(editDraft.code)
+    if(!codeNorm){ toast('コードは英数字4-8文字（スペース不可）'); return }
+    const title = (editDraft.title||'').trim()
+    if(!title){ toast('タイトルは必須です'); return }
+    const payload = {
+      code: codeNorm,
+      title,
+      desc: (editDraft.desc||'').trim(),
+      role: editDraft.role || 'Any',
+      mode: editDraft.mode || 'Other',
+      tags: parseCSV(editDraft.tagsText),
+      heroes: parseCSV(editDraft.heroesText),
+      maps: parseCSV(editDraft.mapsText),
+      updated: new Date().toISOString().slice(0,10),
+    }
+    const { data, error } = await supabase
+      .from('codes')
+      .update(payload)
+      .eq('id', id)
+      .select()
+      .single()
+    if(error){
+      if(error.code==='23505') toast('既に登録済みのコードです')
+      else toast('更新に失敗しました')
+      return
+    }
+    setCodes(list=> list.map(c=> c.id===id ? data : c))
+    cancelEdit()
+    toast('更新しました')
+  }
+  async function deleteCode(id){
+    if(!supaReady || !user) { toast('ログインが必要です'); return }
+    if(!confirm('このコードを削除しますか？')) return
+    const { error } = await supabase.from('codes').delete().eq('id', id)
+    if(error){ toast('削除に失敗しました'); return }
+    setCodes(list=> list.filter(c=> c.id!==id))
+    setLikeCounts(m=>{ const n={...m}; delete n[id]; return n })
+    setUserLiked(m=>{ const n={...m}; delete n[id]; return n })
+    toast('削除しました')
+  }
+
+  // ユーティリティ: CSVを配列へ
+  const parseCSV = (s)=> (s||'')
+    .split(',')
+    .map(x=> x.trim())
+    .filter(Boolean)
+  // コード登録（拡張）
+  const [newCode, setNewCode] = useState({
+    code:'',
+    title:'',
+    desc:'',
+    tagsText:'',
+    heroesText:'',
+    mapsText:'',
+    role:'Any',
+    mode:'Other',
+  })
+
+  function validateCodeFormat(code){
+    const s = (code||'').toUpperCase().replace(/\s+/g,'')
+    return /^[A-Z0-9]{4,8}$/.test(s) ? s : null
+  }
+
   async function addCode(){
     if(!supaReady || !user){ toast('ログインが必要です'); return }
-    const payload = { code: newCode.code.trim(), title: newCode.title.trim(), desc: '', role:'Any', mode:'Other', tags: [], heroes: [], maps: [], author: user.email || 'user', updated: new Date().toISOString().slice(0,10) }
-    if(!payload.code || !payload.title){ toast('コードとタイトルは必須'); return }
+    const codeNorm = validateCodeFormat(newCode.code)
+    if(!codeNorm){ toast('コードは英数字4-8文字（スペース不可）'); return }
+    const title = newCode.title.trim()
+    if(!title){ toast('タイトルは必須です'); return }
+
+    const payload = {
+      code: codeNorm,
+      title,
+      desc: newCode.desc.trim(),
+      role: newCode.role || 'Any',
+      mode: newCode.mode || 'Other',
+      tags: parseCSV(newCode.tagsText),
+      heroes: parseCSV(newCode.heroesText),
+      maps: parseCSV(newCode.mapsText),
+      author: user.email || 'user',
+      updated: new Date().toISOString().slice(0,10),
+    }
+
     const { data, error } = await supabase.from('codes').insert({ ...payload, created_by: user.id }).select().single()
     if(error){
       if(error.code==='23505') toast('既に登録済みのコードです')
@@ -243,7 +389,7 @@ export default function App(){
       return
     }
     setCodes(curr => [data, ...curr])
-    setNewCode({ code:'', title:'' })
+    setNewCode({ code:'', title:'', desc:'', tagsText:'', heroesText:'', mapsText:'', role:'Any', mode:'Other' })
     toast('登録しました')
   }
 
@@ -255,6 +401,30 @@ export default function App(){
   }
   async function logout(){ if(supaReady){ await supabase.auth.signOut(); toast('ログアウトしました') } }
 
+  // ハッシュリンク強調
+  useEffect(()=>{
+    const id = (location.hash||'').replace('#','')
+    if(!id) return
+    const el = document.getElementById(id)
+    if(!el) return
+    el.classList.add('hash-highlight')
+    el.scrollIntoView({ behavior:'smooth', block:'center' })
+    const t = setTimeout(()=> el.classList.remove('hash-highlight'), 1600)
+    return ()=> clearTimeout(t)
+  },[])
+
+  function goToSubmit(){
+    if(!supaReady){ toast('Supabase未設定です'); return }
+    if(!user){
+      toast('ログインすると投稿できます')
+      document.getElementById('login-email')?.focus()
+      return
+    }
+    submitRef.current?.scrollIntoView({ behavior:'smooth', block:'start' })
+    submitRef.current?.classList.add('hash-highlight')
+    setTimeout(()=> submitRef.current?.classList.remove('hash-highlight'), 1600)
+  }
+
   return (
     <div className="min-vh-100 text-light app-gradient">
       {/* ナビゲーション */}
@@ -264,6 +434,7 @@ export default function App(){
           <div className="fw-bolder">OW Custom Codes</div>
           <div className="ms-auto d-flex align-items-center gap-2">
             <span className="d-none d-sm-inline small text-secondary">beta</span>
+            <button className="btn btn-sm btn-primary" onClick={goToSubmit}>投稿</button>
             {supaReady && (
               user ? (
                 <>
@@ -347,23 +518,57 @@ export default function App(){
       {/* グリッド */}
       <main className="container pb-4">
         {supaReady && user && (
-          <div className="card bg-body-tertiary border-0 my-3">
-            <div className="card-body d-flex gap-2 align-items-end">
-              <div className="flex-grow-1">
-                <label className="form-label mb-1">コード</label>
-                <input className="form-control" value={newCode.code} onChange={e=> setNewCode(v=>({...v, code: e.target.value}))} placeholder="例: ABCD12"/>
+          <div ref={submitRef} className="card bg-body-tertiary border-0 my-3">
+            <div className="card-body">
+              <div className="row g-3 align-items-end">
+                <div className="col-12 col-md-3">
+                  <label className="form-label mb-1">コード</label>
+                  <input className="form-control" value={newCode.code} onChange={e=> setNewCode(v=>({...v, code: e.target.value}))} placeholder="例: ABCD12"/>
+                </div>
+                <div className="col-12 col-md-5">
+                  <label className="form-label mb-1">タイトル</label>
+                  <input className="form-control" value={newCode.title} onChange={e=> setNewCode(v=>({...v, title: e.target.value}))} placeholder="タイトル"/>
+                </div>
+                <div className="col-6 col-md-2">
+                  <label className="form-label mb-1">Role</label>
+                  <select className="form-select" value={newCode.role} onChange={e=> setNewCode(v=>({...v, role: e.target.value}))}>
+                    {ROLES.map(r=> <option key={r} value={r}>{r}</option>)}
+                  </select>
+                </div>
+                <div className="col-6 col-md-2">
+                  <label className="form-label mb-1">Mode</label>
+                  <select className="form-select" value={newCode.mode} onChange={e=> setNewCode(v=>({...v, mode: e.target.value}))}>
+                    {MODES.map(m=> <option key={m} value={m}>{m}</option>)}
+                  </select>
+                </div>
+
+                <div className="col-12">
+                  <label className="form-label mb-1">説明</label>
+                  <textarea rows={2} className="form-control" value={newCode.desc} onChange={e=> setNewCode(v=>({...v, desc: e.target.value}))} placeholder="モードの内容や注意点など" />
+                </div>
+                <div className="col-12 col-md-4">
+                  <label className="form-label mb-1">Tags（カンマ区切り）</label>
+                  <input className="form-control" value={newCode.tagsText} onChange={e=> setNewCode(v=>({...v, tagsText: e.target.value}))} placeholder="例: aim, hs, flick"/>
+                </div>
+                <div className="col-12 col-md-4">
+                  <label className="form-label mb-1">Heroes（カンマ区切り）</label>
+                  <input className="form-control" value={newCode.heroesText} onChange={e=> setNewCode(v=>({...v, heroesText: e.target.value}))} placeholder="例: Tracer, Ana"/>
+                </div>
+                <div className="col-12 col-md-4">
+                  <label className="form-label mb-1">Maps（カンマ区切り）</label>
+                  <input className="form-control" value={newCode.mapsText} onChange={e=> setNewCode(v=>({...v, mapsText: e.target.value}))} placeholder="例: Workshop Chamber, Ilios"/>
+                </div>
+
+                <div className="col-12 d-flex justify-content-end">
+                  <button className="btn btn-primary" onClick={addCode}>登録</button>
+                </div>
               </div>
-              <div className="flex-grow-1">
-                <label className="form-label mb-1">タイトル</label>
-                <input className="form-control" value={newCode.title} onChange={e=> setNewCode(v=>({...v, title: e.target.value}))} placeholder="タイトル"/>
-              </div>
-              <button className="btn btn-primary" onClick={addCode}>登録</button>
             </div>
           </div>
         )}
         <div className="row row-cols-1 row-cols-sm-2 row-cols-lg-3 g-3">
         {filtered.map(item => (
-          <article key={item.id} className="col">
+          <article key={item.id} id={item.id} className="col">
             <div className="card h-100 bg-dark text-light border border-secondary-subtle">
               <div className="card-body d-flex flex-column gap-2">
                 <div className="d-flex align-items-start gap-3">
@@ -390,18 +595,74 @@ export default function App(){
                   </div>
                 </div>
 
-                <div className="row row-cols-2 g-2 small text-secondary">
-                  <div><Meta label="Hero" value={item.heroes.join(', ')} /></div>
-                  <div><Meta label="Map" value={item.maps.join(', ')} /></div>
-                  <div><Meta label="Role" value={item.role} /></div>
-                  <div><Meta label="Mode" value={item.mode} /></div>
-                </div>
+                {editingId===item.id ? (
+                  <div className="d-flex flex-column gap-2">
+                    <div className="row g-2">
+                      <div className="col-6">
+                        <label className="form-label mb-1 small">コード</label>
+                        <input className="form-control form-control-sm" value={editDraft.code} onChange={e=> setEditDraft(v=>({...v, code: e.target.value}))} />
+                      </div>
+                      <div className="col-6">
+                        <label className="form-label mb-1 small">タイトル</label>
+                        <input className="form-control form-control-sm" value={editDraft.title} onChange={e=> setEditDraft(v=>({...v, title: e.target.value}))} />
+                      </div>
+                      <div className="col-6">
+                        <label className="form-label mb-1 small">Role</label>
+                        <select className="form-select form-select-sm" value={editDraft.role} onChange={e=> setEditDraft(v=>({...v, role: e.target.value}))}>
+                          {ROLES.map(r=> <option key={r} value={r}>{r}</option>)}
+                        </select>
+                      </div>
+                      <div className="col-6">
+                        <label className="form-label mb-1 small">Mode</label>
+                        <select className="form-select form-select-sm" value={editDraft.mode} onChange={e=> setEditDraft(v=>({...v, mode: e.target.value}))}>
+                          {MODES.map(m=> <option key={m} value={m}>{m}</option>)}
+                        </select>
+                      </div>
+                      <div className="col-12">
+                        <label className="form-label mb-1 small">説明</label>
+                        <textarea rows={2} className="form-control form-control-sm" value={editDraft.desc} onChange={e=> setEditDraft(v=>({...v, desc: e.target.value}))} />
+                      </div>
+                      <div className="col-12 col-md-4">
+                        <label className="form-label mb-1 small">Tags</label>
+                        <input className="form-control form-control-sm" value={editDraft.tagsText} onChange={e=> setEditDraft(v=>({...v, tagsText: e.target.value}))} />
+                      </div>
+                      <div className="col-12 col-md-4">
+                        <label className="form-label mb-1 small">Heroes</label>
+                        <input className="form-control form-control-sm" value={editDraft.heroesText} onChange={e=> setEditDraft(v=>({...v, heroesText: e.target.value}))} />
+                      </div>
+                      <div className="col-12 col-md-4">
+                        <label className="form-label mb-1 small">Maps</label>
+                        <input className="form-control form-control-sm" value={editDraft.mapsText} onChange={e=> setEditDraft(v=>({...v, mapsText: e.target.value}))} />
+                      </div>
+                    </div>
+                    <div className="d-flex justify-content-end gap-2">
+                      <button className="btn btn-sm btn-outline-secondary" onClick={cancelEdit}>キャンセル</button>
+                      <button className="btn btn-sm btn-primary" onClick={()=> saveEdit(item.id)}>保存</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="row row-cols-2 g-2 small text-secondary">
+                    <div><Meta label="Hero" value={item.heroes.join(', ')} /></div>
+                    <div><Meta label="Map" value={item.maps.join(', ')} /></div>
+                    <div><Meta label="Role" value={item.role} /></div>
+                    <div><Meta label="Mode" value={item.mode} /></div>
+                  </div>
+                )}
 
                 <div className="d-flex flex-wrap gap-2">
                   {item.tags.map(t=> <span key={t} className="badge rounded-pill bg-secondary-subtle text-dark">#{t}</span>)}
                 </div>
 
-                <div className="mt-1 small text-secondary">更新 {item.updated}{item.author? ` ・ by ${item.author}`:''}</div>
+                <div className="mt-1 small text-secondary d-flex align-items-center gap-2">
+                  <span>更新 {item.updated}{item.author? ` ・ by ${item.author}`:''}</span>
+                  {supaReady && user && item.created_by===user.id && editingId!==item.id && (
+                    <>
+                      <span className="text-secondary">|</span>
+                      <button className="btn btn-sm btn-outline-info" onClick={()=> startEdit(item)}>編集</button>
+                      <button className="btn btn-sm btn-outline-danger" onClick={()=> deleteCode(item.id)}>削除</button>
+                    </>
+                  )}
+                </div>
 
                 <div className="mt-2 d-flex align-items-center gap-2">
                   {/* コードは箱をクリックでコピー（ボタンは撤去） */}
@@ -429,6 +690,14 @@ export default function App(){
             </div>
           </article>
         ))}
+
+        {hasMore && supaReady && (
+          <div className="col-12 d-flex justify-content-center mt-3">
+            <button disabled={isLoading} className="btn btn-outline-light" onClick={()=> fetchPage(Math.ceil(codes.length / PAGE_SIZE))}>
+              {isLoading? '読み込み中...' : 'さらに読み込む'}
+            </button>
+          </div>
+        )}
 
         {filtered.length===0 && (
           <>
@@ -504,7 +773,7 @@ function EmailLogin({ onSubmit }){
   const [email, setEmail] = useState('')
   return (
     <form className="d-flex gap-2" onSubmit={(e)=>{ e.preventDefault(); onSubmit?.(email) }}>
-      <input type="email" required className="form-control form-control-sm" placeholder="メールアドレス" value={email} onChange={e=> setEmail(e.target.value)} />
+      <input id="login-email" type="email" required className="form-control form-control-sm" placeholder="メールアドレス" value={email} onChange={e=> setEmail(e.target.value)} />
       <button className="btn btn-sm btn-outline-light" type="submit">ログイン</button>
     </form>
   )

@@ -38,20 +38,68 @@ alter table public.codes enable row level security;
 alter table public.likes enable row level security;
 alter table public.profiles enable row level security;
 
--- Policies
-create policy if not exists "codes_select_all" on public.codes
-  for select using (true);
-create policy if not exists "codes_insert_owner" on public.codes
-  for insert with check (auth.uid() = created_by);
-create policy if not exists "codes_update_owner" on public.codes
-  for update using (auth.uid() = created_by);
-create policy if not exists "codes_delete_owner" on public.codes
-  for delete using (auth.uid() = created_by);
+-- NOTE: PostgreSQL (Supabase) では CREATE POLICY IF NOT EXISTS は未対応のため
+--       idempotent にするために DO $$ ... $$ ブロックで存在確認して作成します。
 
-create policy if not exists "likes_select_all" on public.likes
-  for select using (true);
-create policy if not exists "likes_insert_self" on public.likes
-  for insert with check (auth.uid() = user_id);
-create policy if not exists "likes_delete_self" on public.likes
-  for delete using (auth.uid() = user_id);
+do $$ begin
+  if not exists (
+    select 1 from pg_policies where schemaname='public' and tablename='codes' and policyname='codes_select_all'
+  ) then
+    create policy "codes_select_all" on public.codes
+      for select using (true);
+  end if;
+end $$;
 
+do $$ begin
+  if not exists (
+    select 1 from pg_policies where schemaname='public' and tablename='codes' and policyname='codes_insert_owner'
+  ) then
+    create policy "codes_insert_owner" on public.codes
+      for insert with check (auth.uid() = created_by);
+  end if;
+end $$;
+
+do $$ begin
+  if not exists (
+    select 1 from pg_policies where schemaname='public' and tablename='codes' and policyname='codes_update_owner'
+  ) then
+    create policy "codes_update_owner" on public.codes
+      for update using (auth.uid() = created_by);
+  end if;
+end $$;
+
+do $$ begin
+  if not exists (
+    select 1 from pg_policies where schemaname='public' and tablename='codes' and policyname='codes_delete_owner'
+  ) then
+    create policy "codes_delete_owner" on public.codes
+      for delete using (auth.uid() = created_by);
+  end if;
+end $$;
+
+do $$ begin
+  if not exists (
+    select 1 from pg_policies where schemaname='public' and tablename='likes' and policyname='likes_select_all'
+  ) then
+    create policy "likes_select_all" on public.likes
+      for select using (true);
+  end if;
+end $$;
+
+do $$ begin
+  if not exists (
+    select 1 from pg_policies where schemaname='public' and tablename='likes' and policyname='likes_insert_self'
+  ) then
+    create policy "likes_insert_self" on public.likes
+      for insert with check (auth.uid() = user_id);
+  end if;
+end $$;
+
+do $$ begin
+  if not exists (
+    select 1 from pg_policies where schemaname='public' and tablename='likes' and policyname='likes_delete_self'
+  ) then
+    create policy "likes_delete_self" on public.likes
+      for delete using (auth.uid() = user_id);
+  end if;
+end $$;

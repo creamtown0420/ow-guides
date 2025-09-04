@@ -33,6 +33,7 @@ Behavior without Supabase env: the app falls back to static seed data; likes use
 - `npm run dev` – start dev server
 - `npm run build` – production build (outputs to `dist/`)
 - `npm run preview` – preview built files
+- `npm run note -- "text"` – append a timestamped note to `NOTES.md`
 
 ## Deploy
 Any static host works (GitHub Pages, Netlify, Vercel, etc.). For GitHub Pages (Actions):
@@ -42,3 +43,10 @@ Any static host works (GitHub Pages, Netlify, Vercel, etc.). For GitHub Pages (A
 - Likes base count is 0. All displayed likes come from DB (or localStorage fallback).
 - Codes table enforces `code` uniqueness; the app surfaces an error if duplicate.
 - No Bootstrap JS used; only CSS.
+
+## Submit Form (fields)
+- Code: alphanumeric 4–8 chars (uppercased)
+- Title: required
+- Description: optional free text
+- Role/Mode: select from predefined
+- Tags/Heroes/Maps: comma-separated (e.g., `aim, hs, flick`)
