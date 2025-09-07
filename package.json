@@ -11,9 +11,10 @@
     "note": "node scripts/note.mjs"
   },
   "dependencies": {
-    "bootstrap": "^5.3.8",
     "@supabase/supabase-js": "^2.45.4",
+    "bootstrap": "^5.3.8",
     "lucide-react": "^0.542.0",
+    "nodemon": "^3.1.10",
     "react": "^19.1.1",
     "react-bootstrap": "^2.10.10",
     "react-dom": "^19.1.1"

@@ -5,11 +5,12 @@ create extension if not exists pgcrypto;
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   email text,
+  username text default null unique,
   created_at timestamp with time zone default now()
 );
 
 -- username column for display name
-alter table public.profiles add column if not exists username text;
+-- alter table public.profiles add column if not exists username text;
 
 -- codes: unique by code
 create table if not exists public.codes (
