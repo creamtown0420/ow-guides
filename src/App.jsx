@@ -1,6 +1,7 @@
 import { useMemo, useState, useEffect, useRef } from 'react'
 import { Search, Star, Copy, Share2, Filter, ChevronDown, Flame, Swords } from 'lucide-react'
 import { supabase } from './lib/supabaseClient.js'
+import { isSupabaseDebugEnabled } from './lib/debugFlag.js'
 
 /**
  * OW Custom Codes Explorer — Tailwind + lucide-react（改訂版）
@@ -102,10 +103,14 @@ export default function App(){
 
   // Supabase 認証・データ
   const [user, setUser] = useState(null)
+  const [profileName, setProfileName] = useState('')
   const [codes, setCodes] = useState(seedCodes)
   const [likeCounts, setLikeCounts] = useState({}) // {code_id: number}
   const [userLiked, setUserLiked] = useState({}) // {code_id: true}
   const supaReady = !!supabase
+
+  const debugEnabled = isSupabaseDebugEnabled()
+  const [debugInfo, setDebugInfo] = useState(null)
 
   useEffect(()=>{
     if(!supaReady) return
@@ -115,6 +120,26 @@ export default function App(){
     })
     return ()=> { sub?.subscription?.unsubscribe?.() }
   },[supaReady])
+
+  // プロフィール（表示名）取得
+  useEffect(()=>{
+    if(!supaReady || !user){ setProfileName(''); return }
+    ;(async()=>{
+      const { data, error } = await supabase.from('profiles').select('username').eq('id', user.id).maybeSingle?.() ?? await supabase.from('profiles').select('username').eq('id', user.id).single().catch(()=>({data:null,error:true}))
+      if(!error && data){ setProfileName(data.username || '') }
+    })()
+  },[supaReady, user])
+
+  async function saveProfileName(){
+    if(!supaReady || !user){ toast('ログインが必要です'); return }
+    const name = (profileName||'').trim()
+    if(!name){ toast('表示名を入力してください'); return }
+    if(!/^[A-Za-z0-9_\-]{3,20}$/.test(name)){ toast('3-20文字の英数・_・-のみ'); return }
+    const payload = { id: user.id, email: user.email || null, username: name }
+    const { error } = await supabase.from('profiles').upsert(payload, { onConflict: 'id' })
+    if(error){ toast('保存に失敗しました'); return }
+    toast('表示名を保存しました')
+  }
 
   // ページング関連
   const PAGE_SIZE = 12
@@ -184,6 +209,44 @@ export default function App(){
     if(!supaReady) return
     if(codes.length===0 && hasMore && !isLoading){ fetchPage(0) }
   },[supaReady, codes.length])
+
+  // デバッグ: 起動時の環境確認（UIに影響しない）
+  useEffect(()=>{
+    if(!debugEnabled) return
+    const { VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY } = import.meta.env
+    const envUrl = VITE_SUPABASE_URL
+    const envAnon = !!VITE_SUPABASE_ANON_KEY
+    setDebugInfo({ stage: 'init', envUrl, envAnon, supaReady: !!supaReady })
+  },[debugEnabled, supaReady])
+
+  async function runSupabaseSelfCheck(){
+    const { VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY } = import.meta.env
+    const envUrl = VITE_SUPABASE_URL
+    const envAnon = !!VITE_SUPABASE_ANON_KEY
+    const result = { stage:'self-check', envUrl, envAnon, supaReady: !!supaReady }
+    try {
+      if(!supaReady){
+        result.reason = {
+          missingUrl: !envUrl,
+          missingAnon: !envAnon,
+        }
+        setDebugInfo(result)
+        return
+      }
+      const [{ data: sessData }, codesResp, likesResp] = await Promise.all([
+        supabase.auth.getSession(),
+        supabase.from('codes').select('id', { count: 'exact', head: true }),
+        supabase.from('likes').select('code_id', { count: 'exact', head: true }),
+      ])
+      result.sessionUser = sessData?.session?.user?.id || null
+      result.codes = { count: codesResp.count ?? null, error: codesResp.error?.message || null }
+      result.likes = { count: likesResp.count ?? null, error: likesResp.error?.message || null }
+      setDebugInfo(result)
+    } catch (e) {
+      result.error = String(e?.message || e)
+      setDebugInfo(result)
+    }
+  }
 
   // 読み込み済みコードに対して自分のいいね状態を補完
   useEffect(()=>{
@@ -378,7 +441,7 @@ export default function App(){
       tags: parseCSV(newCode.tagsText),
       heroes: parseCSV(newCode.heroesText),
       maps: parseCSV(newCode.mapsText),
-      author: user.email || 'user',
+      author: (profileName||'') || user.email || 'user',
       updated: new Date().toISOString().slice(0,10),
     }
 
@@ -438,7 +501,18 @@ export default function App(){
             {supaReady && (
               user ? (
                 <>
-                  <span className="small text-secondary d-none d-md-inline">{user.email}</span>
+                  <span className="small text-secondary d-none d-md-inline">{profileName ? `@${profileName}` : (user.email)}</span>
+                  <form className="d-none d-lg-flex align-items-center gap-2" onSubmit={(e)=>{e.preventDefault(); saveProfileName()}}>
+                    <input
+                      className="form-control form-control-sm"
+                      style={{width:160}}
+                      placeholder="表示名 (3-20文字)"
+                      value={profileName}
+                      onChange={e=> setProfileName(e.target.value)}
+                      title="投稿時の表示名。英数と _ - が使用可"
+                    />
+                    <button type="submit" className="btn btn-sm btn-outline-light">保存</button>
+                  </form>
                   <button className="btn btn-sm btn-outline-light" onClick={logout}>ログアウト</button>
                 </>
               ) : (
@@ -764,6 +838,22 @@ export default function App(){
       <footer className="container pb-4 small text-secondary d-flex align-items-center gap-2">
         <Flame className="icon-12"/> Overwatch™ fan-made content — use at your own risk.
       </footer>
+
+      {debugEnabled && (
+        <div style={{position:'fixed', right:12, bottom:12, maxWidth:420, zIndex:9999}}>
+          <div className="card bg-dark text-light border border-secondary-subtle">
+            <div className="card-body">
+              <div className="d-flex justify-content-between align-items-center mb-2">
+                <strong>Supabase Debug</strong>
+                <button className="btn btn-sm btn-outline-light" onClick={runSupabaseSelfCheck}>Self-Check</button>
+              </div>
+              <pre className="small mb-0" style={{whiteSpace:'pre-wrap'}}>
+{JSON.stringify(debugInfo || { hint: 'Click Self-Check or add ?debug=supabase' }, null, 2)}
+              </pre>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
